@@ -18,6 +18,22 @@ const app = new App({
 const VALIDADOR_API_URL = process.env.VALIDADOR_API_URL || 'https://api.exemplo.local/v1';
 const VALIDADOR_TOKEN = process.env.VALIDADOR_TOKEN;
 
+// --- NORMALIZAÇÃO DE TEXTO (acentos, maiúsculas) ---
+function normalizar(texto) {
+  return String(texto).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+}
+
+const DIAS_SEMANA = {
+  segunda: 'segunda', terca: 'terça', quarta: 'quarta', quinta: 'quinta',
+  sexta: 'sexta', sabado: 'sábado', domingo: 'domingo'
+};
+
+// Aceita "terça", "terca", "Terça-feira", "SABADO"... e devolve o nome canônico com acento
+function identificarDia(texto) {
+  const chave = normalizar(texto).replace(/-?feira$/, '');
+  return DIAS_SEMANA[chave] || null;
+}
+
 // --- FUNÇÕES DE ESTADO E DB ---
 async function setState(userId, step, payload = {}) {
   await db.query(
@@ -94,7 +110,26 @@ app.message(async ({ message, client }) => {
   if (!state || state.step === 'idle') return;
 
   if (state.step === 'aguardando_materias') {
-    const ids = message.text.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    // Aceita IDs (1, 2) ou nomes com/sem acento (Matemática, matematica, design)
+    const subjectsRes = await db.query('SELECT id, name FROM subjects');
+    const ids = [];
+    for (const item of message.text.split(/[,\n;]/).map(t => t.trim()).filter(Boolean)) {
+      let subject;
+      if (/^\d+$/.test(item)) {
+        subject = subjectsRes.rows.find(sub => sub.id === parseInt(item));
+      } else {
+        const alvo = normalizar(item);
+        subject = subjectsRes.rows.find(sub => {
+          const nome = normalizar(sub.name);
+          return nome === alvo || nome.split('/').includes(alvo);
+        });
+      }
+      if (subject && !ids.includes(subject.id)) ids.push(subject.id);
+    }
+    if (ids.length === 0) {
+      await client.chat.postMessage({ channel: message.channel, text: 'Não reconheci nenhuma matéria. Digite os IDs ou os nomes (ex: 1, Matemática).' });
+      return;
+    }
     let mentorRes = await db.query('SELECT id FROM mentors WHERE slack_user_id = $1', [message.user]);
     if (mentorRes.rows.length === 0) {
       const userInfo = await client.users.info({ user: message.user });
@@ -103,7 +138,7 @@ app.message(async ({ message, client }) => {
     const mentorId = mentorRes.rows[0].id;
     for (let subjectId of ids) await db.query('INSERT INTO mentor_subjects (mentor_id, subject_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [mentorId, subjectId]);
     await setState(message.user, 'aguardando_horarios');
-    await client.chat.postMessage({ channel: message.channel, text: 'Matérias guardadas! Agora envie os seus horários (ex: segunda 13)' });
+    await client.chat.postMessage({ channel: message.channel, text: 'Matérias guardadas! Agora envie os seus horários (ex: terça 13)' });
     return;
   }
 
@@ -112,10 +147,12 @@ app.message(async ({ message, client }) => {
     const mentorRes = await db.query('SELECT id FROM mentors WHERE slack_user_id = $1', [message.user]);
     let successCount = 0;
     for (let linha of linhas) {
-      const partes = linha.trim().toLowerCase().split(' ');
+      const partes = linha.trim().split(/\s+/);
       if (partes.length === 2) {
-        if (['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo'].includes(partes[0])) {
-          await db.query('INSERT INTO mentor_slots (mentor_id, weekday, hour) VALUES ($1, $2, $3)', [mentorRes.rows[0].id, partes[0], parseInt(partes[1])]);
+        const dia = identificarDia(partes[0]);
+        const hora = parseInt(partes[1]);
+        if (dia && !isNaN(hora)) {
+          await db.query('INSERT INTO mentor_slots (mentor_id, weekday, hour) VALUES ($1, $2, $3)', [mentorRes.rows[0].id, dia, hora]);
           successCount++;
         }
       }
